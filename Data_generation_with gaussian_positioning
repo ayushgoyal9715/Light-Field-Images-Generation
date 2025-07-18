@@ -1,0 +1,200 @@
+import random
+import os
+import numpy as np
+from PIL import Image
+import torch
+from torch.utils.data import Dataset
+import torchvision.transforms as transforms
+from tqdm import tqdm # A nice progress bar for long operations
+
+# --- The old generation functions are no longer needed and have been removed ---
+# def gen_ran_cord(...): ...
+# def find_sol_X(...): ...
+# def find_sol_plus(...): ...
+# def regeneration(...): ...
+
+# Define the root path and load data folders
+# NOTE: Make sure this path is correct for your system
+root_path = "/home/ag/lfi/dataset/lofimages"
+# Handle case where the directory might not exist for testing
+if os.path.exists(root_path):
+    data_folders = sorted([os.path.join(root_path, d) for d in os.listdir(root_path) if os.path.isdir(os.path.join(root_path, d))])
+else:
+    print(f"Warning: Data directory not found at '{root_path}'. The script will run but the dataset will be empty.")
+    data_folders = []
+
+
+# --- REBUILT AND IMPROVED DATASET CLASS ---
+class LightFieldDataset(Dataset):
+    """
+    Generates a robust dataset for view synthesis.
+
+    For each sample, it randomly selects:
+    1. A spatial configuration ('plus' or 'x' shape).
+    2. A distance for the input cameras from the ground truth.
+    This ensures the model is trained on a wide variety of input-output relationships,
+    making it more robust.
+    """
+    def __init__(self, data_folders, num_samples=2000, target_size=(256, 256),
+                 min_dist=1, max_dist=8, transform=None, side_frame_transform=None):
+        """
+        Args:
+            data_folders (list): List of paths to the data folders.
+            num_samples (int): The total number of samples to generate for the dataset.
+            target_size (tuple): The target size (H, W) for the images.
+            min_dist (int): The minimum distance (j-value) for input cameras.
+            max_dist (int): The maximum distance (j-value) for input cameras.
+        """
+        self.data_folders = data_folders
+        self.num_samples = num_samples
+        self.target_size = target_size
+        self.min_dist = min_dist
+        self.max_dist = max_dist
+
+        self.transform = transform if transform else transforms.Compose([
+            transforms.Resize(self.target_size),
+            transforms.ToTensor(),
+        ])
+        self.side_frame_transform = side_frame_transform if side_frame_transform else transforms.Compose([
+            transforms.ToTensor(),
+            transforms.GaussianBlur(kernel_size=5, sigma=1.0)
+        ])
+
+        # The data list will be populated by our new, robust generation method
+        self.data_list = self._generate_robust_data_list()
+
+    def _generate_robust_data_list(self):
+        print(f"Generating {self.num_samples} samples with distances from {self.min_dist} to {self.max_dist}...")
+        data_list = []
+
+        # Use a set to avoid duplicate samples, which can happen with random generation
+        seen_samples = set()
+
+        # Grid boundaries (assuming 51x51 grid)
+        n, m = 51, 51
+
+        # Use tqdm for a progress bar, as this might take a moment
+        pbar = tqdm(total=self.num_samples, desc="Generating Data")
+
+        attempts = 0
+        max_attempts = self.num_samples * 20 # Safety break to prevent infinite loops
+
+        while len(data_list) < self.num_samples and attempts < max_attempts:
+            attempts += 1
+
+            # 1. RANDOMLY CHOOSE A FOLDER
+            data_path = random.choice(self.data_folders)
+
+            # 2. RANDOMLY CHOOSE CONFIGURATION (SHAPE AND DISTANCE)
+            shape = random.choice(['plus', 'x'])
+            dist = random.randint(self.min_dist, self.max_dist)
+
+            # 3. RANDOMLY CHOOSE A CENTER COORDINATE (GROUND TRUTH)
+            # Ensure the center is far enough from the edges for the chosen distance
+            gt_x = random.randint(dist, n - 1 - dist)
+            gt_y = random.randint(dist, m - 1 - dist)
+            gt_coords = (gt_x, gt_y)
+
+            # 4. CALCULATE INPUT COORDINATES BASED ON SHAPE AND DISTANCE
+            if shape == 'plus':
+                input_coords_list = [
+                    (gt_x, gt_y + dist),  # right
+                    (gt_x, gt_y - dist),  # left
+                    (gt_x - dist, gt_y),  # up
+                    (gt_x + dist, gt_y)   # down
+                ]
+            else: # shape == 'x'
+                input_coords_list = [
+                    (gt_x - dist, gt_y + dist), # right-up
+                    (gt_x - dist, gt_y - dist), # left-up
+                    (gt_x + dist, gt_y + dist), # right-down
+                    (gt_x + dist, gt_y - dist)  # left-down
+                ]
+
+            # 5. VERIFY ALL IMAGE FILES EXIST
+            gt_file = f"x_{gt_coords[0]}_y_{gt_coords[1]}.jpg"
+            gt_path = os.path.join(data_path, gt_file)
+
+            if not os.path.exists(gt_path):
+                continue # Try again if GT image doesn't exist
+
+            input_paths = []
+            all_inputs_exist = True
+            for coord in input_coords_list:
+                input_file = f"x_{coord[0]}_y_{coord[1]}.jpg"
+                input_path = os.path.join(data_path, input_file)
+                if os.path.exists(input_path):
+                    input_paths.append(input_path)
+                else:
+                    all_inputs_exist = False
+                    break # One of the inputs is missing, this sample is invalid
+
+            # 6. IF EVERYTHING IS VALID, ADD TO OUR LIST
+            if all_inputs_exist:
+                # Create a unique key for the 'seen_samples' set
+                sample_key = (gt_path,) + tuple(sorted(input_paths))
+                if sample_key not in seen_samples:
+                    data_list.append((gt_path, input_paths, gt_coords, input_coords_list))
+                    seen_samples.add(sample_key)
+                    pbar.update(1) # Update the progress bar
+
+        pbar.close()
+        if len(data_list) < self.num_samples:
+            print(f"\nWarning: Could only generate {len(data_list)} unique samples out of the {self.num_samples} requested.")
+        else:
+             print(f"\nSuccessfully generated {len(data_list)} unique samples.")
+
+        return data_list
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        gt_path, input_paths, gt_coords, input_coords_list = self.data_list[idx]
+
+        # Load images
+        gt_image = self.transform(Image.open(gt_path).convert('RGB'))
+        input_images = [self.transform(Image.open(p).convert('RGB')) for p in input_paths]
+        input_stack = torch.stack(input_images, dim=0)
+
+        # Generate side frame (coordinate map)
+        side_frame_np = np.zeros((51, 51), dtype=np.uint8)
+        side_frame_np[gt_coords[0], gt_coords[1]] = 255
+        for x, y in input_coords_list:
+            side_frame_np[x, y] = 255
+        side_frame_tensor = self.side_frame_transform(side_frame_np)
+
+        # Calculate sum of Manhattan distances
+        total_manhattan_distance = 0
+        gt_x, gt_y = gt_coords
+        for in_x, in_y in input_coords_list:
+            distance = abs(gt_x - in_x) + abs(gt_y - in_y)
+            total_manhattan_distance += distance
+        manhattan_distance_tensor = torch.tensor(total_manhattan_distance, dtype=torch.float32)
+
+        return input_stack, gt_image, side_frame_tensor, manhattan_distance_tensor
+
+if __name__ == "__main__":
+    if data_folders:
+        # Create dataset with the new robust generator
+        # You can easily change num_samples, min_dist, and max_dist here
+        dataset = LightFieldDataset(data_folders, num_samples=14000, min_dist=1, max_dist=10)
+
+        if len(dataset) > 0:
+            from torch.utils.data import DataLoader
+            dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=4, pin_memory=True)
+
+            print("\n--- Iterating through a few batches to show variety ---")
+            # Iterate through a few batches to see the diverse distances
+            for i, (input_stack, gt_image, side_frame, manhattan_distances) in enumerate(dataloader):
+                if i >= 3: # Stop after 3 batches
+                    break
+
+                print(f"\n--- Batch {i+1} ---")
+                print(f"Manhattan distances: {manhattan_distances.numpy()}")
+                # Expected output: A list of varied numbers, e.g., [ 8. 40. 24. 16. 32.  4. 20. 28.]
+                # Note: For 'plus' shape, dist=j, sum is 4*j. For 'x' shape, dist=j, sum is 8*j.
+        else:
+            print("Dataset is empty. Cannot create a dataloader.")
+    else:
+        print("Skipping dataloader demonstration because no data folders were found.")
